@@ -5,8 +5,8 @@ Coordinate system: y=0 at the bottom of the screen, increasing upward.
 Rendering converts to pygame screen coordinates via: screen_y = WINDOW_HEIGHT - y.
 
 Controls (keyboard):
-  SPACE   — flap (manual mode) / human flap (human-in-loop mode)
-  M       — cycle through modes: manual → pid → mpc → human_in_loop
+  SPACE   — flap (manual mode only)
+  M       — cycle through modes: manual → pid → mpc
   R       — reset game
   ESC     — quit
 """
@@ -35,7 +35,7 @@ GRAVITY: float = -80.0  # vertical acceleration (world coords, downward)
 FLAP_FORCE: float = 100.0  # upward velocity given per manual flap (world coords)
 BG_COLOR = (135, 206, 235)
 
-MODES = ["manual", "pid", "mpc", "human_in_loop"]
+MODES = ["manual", "pid", "mpc"]
 
 
 # ---------------------------------------------------------------------------
@@ -383,50 +383,6 @@ def calculate_control_signal(bird: Bird, pipe: Pipe, controller) -> float:
 
 
 # ---------------------------------------------------------------------------
-# 1.3  Human-in-the-Loop control signal
-# ---------------------------------------------------------------------------
-def calculate_control_signal_human(
-    bird: Bird,
-    pipe: Pipe,
-    controller,
-    human_flap: bool,
-    alpha: float = 0.5,
-) -> float:
-    """Blend the human's flap input with an automated controller's output.
-
-    Args:
-        bird:        Current bird state.
-        pipe:        Current pipe state.
-        controller:  Automated controller (PID or MPC).
-        human_flap:  True if the human pressed the flap key this frame.
-        alpha:       Weight for the human input in [0, 1].
-                     alpha=1 → pure human, alpha=0 → pure controller.
-
-    Returns:
-        Blended control signal.
-    """
-    human_signal = FLAP_FORCE if human_flap else 0.0
-    auto_signal = calculate_control_signal(bird, pipe, controller)
-
-    # Distance-based alpha: trust the controller more as the pipe approaches.
-    distance_to_pipe = max(0.0, pipe.x - (bird.x + bird.w))
-    if distance_to_pipe < 100:
-        dynamic_alpha = 0.1   # pipe imminent — mostly controller
-    elif distance_to_pipe < 300:
-        dynamic_alpha = 0.3   # approaching — mixed
-    else:
-        dynamic_alpha = alpha  # far away — respect human weight
-
-    # Safety override: near floor or ceiling the controller takes over entirely.
-    near_floor = bird.y < 40.0
-    near_ceiling = bird.y > WINDOW_HEIGHT - 60.0
-    if near_floor or near_ceiling:
-        return auto_signal
-
-    return dynamic_alpha * human_signal + (1.0 - dynamic_alpha) * auto_signal
-
-
-# ---------------------------------------------------------------------------
 # Rendering helpers
 # ---------------------------------------------------------------------------
 def _world_to_screen_y(world_y: float) -> int:
@@ -474,13 +430,11 @@ def main() -> None:
         return Bird(), Pipe(), 0
 
     bird, pipe, score = reset()
-    human_flap = False
     running = True
 
     while running:
         dt = clock.tick(FPS) / 1000.0
 
-        human_flap = False
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
@@ -499,8 +453,6 @@ def main() -> None:
                         bird.vy = (
                             max(0.0, bird.vy) + FLAP_FORCE
                         )  # cancel downward momentum, then flap
-                    elif mode == "human_in_loop":
-                        human_flap = True
 
         # --- Compute control ---
         if mode == "manual":
@@ -509,8 +461,6 @@ def main() -> None:
             control = calculate_control_signal(bird, pipe, pid)
         elif mode == "mpc":
             control = calculate_control_signal(bird, pipe, mpc)
-        elif mode == "human_in_loop":
-            control = calculate_control_signal_human(bird, pipe, pid, human_flap)
         else:
             control = 0.0
 
