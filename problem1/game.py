@@ -18,6 +18,13 @@ from dataclasses import dataclass, field
 
 import pygame
 
+try:
+    import numpy as np
+    from scipy.optimize import minimize as _scipy_minimize
+    _SCIPY_AVAILABLE = True
+except ImportError:
+    _SCIPY_AVAILABLE = False
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -115,9 +122,9 @@ def check_collision(bird: Bird, pipe: Pipe) -> bool:
 # ---------------------------------------------------------------------------
 @dataclass
 class PIDController:
-    Kp: float = 1.5
-    Ki: float = 0.001
-    Kd: float = 0.5
+    Kp: float = 9.0   # tuned for double-integrator plant with gravity feedforward
+    Ki: float = 0.1
+    Kd: float = 6.0
     error_accumulator: float = 0.0
     prev_error: float = 0.0
     max_accumulator: float = 200.0
@@ -150,28 +157,32 @@ class PIDController:
         """
         error = set_point - process_var
 
-        # TODO (1.1): Implement the PID control algorithm.
-        #
-        #   Steps:
-        #     1. Accumulate error for the integral term:
-        #          self.error_accumulator += error * self.dt
-        #        Apply anti-windup by clamping to ±self.max_accumulator.
-        #
-        #     2. Compute derivative term.  Two options:
-        #          a) Finite difference:  (error - self.prev_error) / self.dt
-        #          b) Velocity feedback:  -velocity   (avoids derivative kick)
-        #
-        #     3. Combine terms:
-        #          u = Kp * error + Ki * error_accumulator + Kd * derivative
-        #
-        #     4. Clamp output to [umin, umax].
-        #
-        #     5. Update self.prev_error = error before returning.
-        #
-        # Adjust the Kp, Ki, Kd parameters to achieve good performance (stable flight,
-        # responsive control, minimal overshoot).
-        # Remove or replace the line below once you implement the algorithm.
-        return 0.0
+        # 1. Integral with anti-windup
+        self.error_accumulator += error * self.dt
+        self.error_accumulator = max(
+            -self.max_accumulator, min(self.max_accumulator, self.error_accumulator)
+        )
+
+        # 2. Derivative via velocity feedback — avoids derivative kick on setpoint changes
+        derivative = -velocity
+
+        # 3. Gravity feedforward cancels the constant -80 downward acceleration so
+        #    the P/I/D terms only need to handle tracking deviations.
+        gravity_ff = -GRAVITY  # = 80.0
+
+        u = (
+            self.Kp * error
+            + self.Ki * self.error_accumulator
+            + self.Kd * derivative
+            + gravity_ff
+        )
+
+        # 4. Clamp
+        u = max(umin, min(umax, u))
+
+        # 5. Store for next call
+        self.prev_error = error
+        return u
 
 
 # ---------------------------------------------------------------------------
@@ -242,25 +253,62 @@ class MPCController:
         Returns:
             Scalar cost (lower is better).
         """
-        # TODO (1.2): Design a meaningful cost function.
-        #
-        #   Suggested terms:
-        #     - Tracking error:  sum((y - target)**2 for y, _ in states)
-        #     - Control effort:  sum(u**2 for u in inputs)  * weight
-        #     - Terminal cost:   extra weight on the final state error
-        #     - Safety penalty:  large value if y hits 0 or WINDOW_HEIGHT
-        #
-        # Placeholder: tracking error only (no effort penalty).
-        total = sum((y - target) ** 2 for y, _ in states)
-        return total
+        n = len(states)
+        cost = 0.0
+
+        for i, (y, _) in enumerate(states):
+            # Tracking error — weight increases toward end of horizon so the
+            # optimizer cares more about where the bird ends up than the path.
+            step_weight = (i + 1) / n
+            cost += step_weight * (y - target) ** 2
+
+            # Soft floor / ceiling barriers prevent the optimizer from planning
+            # trajectories that graze the window edges.
+            cost += 1e4 * max(0.0, 15.0 - y) ** 2
+            cost += 1e4 * max(0.0, y - (WINDOW_HEIGHT - 15.0)) ** 2
+
+        # Small control-effort penalty → prefer gentle inputs over bang-bang.
+        cost += 1e-4 * sum(u ** 2 for u in inputs)
+
+        # Terminal velocity penalty: arrive at target with near-zero vertical speed.
+        if states:
+            _, final_vy = states[-1]
+            cost += 0.5 * final_vy ** 2
+
+        return cost
 
     def _optimize(self, y0: float, vy0: float, target: float) -> list[float]:
-        """Find the input sequence that minimises self._cost().
+        """Find the input sequence that minimises self._cost() via L-BFGS-B.
 
-        TODO (1.2): Replace this stub with a real optimisation method.
+        Falls back to random shooting when scipy is unavailable.
         """
-        # Stub: return zero inputs (bird will fall).
-        return [0.0] * self.horizon
+        if _SCIPY_AVAILABLE:
+            def objective(u_arr: "np.ndarray") -> float:
+                states = self._simulate(y0, vy0, u_arr.tolist())
+                return self._cost(states, target, u_arr.tolist())
+
+            x0 = np.array(self._last_inputs)
+            bounds = [(self.umin, self.umax)] * self.horizon
+            result = _scipy_minimize(
+                objective,
+                x0,
+                method="L-BFGS-B",
+                bounds=bounds,
+                options={"maxiter": 50, "ftol": 1e-4},
+            )
+            return result.x.tolist()
+
+        # Fallback: random shooting — sample candidates, keep the best.
+        best_inputs = self._last_inputs[:]
+        best_cost = float("inf")
+        for _ in range(200):
+            inputs = [random.uniform(self.umin, self.umax) for _ in range(self.horizon)]
+            states = self._simulate(y0, vy0, inputs)
+            c = self._cost(states, target, inputs)
+            if c < best_cost:
+                best_cost = c
+                best_inputs = inputs
+        return best_inputs
 
     # ------------------------------------------------------------------
     # Public interface (same signature as PIDController.calc_input)
@@ -288,7 +336,6 @@ class MPCController:
         # Warm-start: shift previous solution left and pad with zero.
         self._last_inputs = self._last_inputs[1:] + [0.0]
 
-        # TODO (1.2): Call self._optimize and store the result.
         best_inputs = self._optimize(process_var, velocity, set_point)
         self._last_inputs = best_inputs
 
@@ -361,8 +408,22 @@ def calculate_control_signal_human(
     human_signal = FLAP_FORCE if human_flap else 0.0
     auto_signal = calculate_control_signal(bird, pipe, controller)
 
-    # TODO (1.3): Design a blending / filtering strategy.
-    return 0
+    # Distance-based alpha: trust the controller more as the pipe approaches.
+    distance_to_pipe = max(0.0, pipe.x - (bird.x + bird.w))
+    if distance_to_pipe < 100:
+        dynamic_alpha = 0.1   # pipe imminent — mostly controller
+    elif distance_to_pipe < 300:
+        dynamic_alpha = 0.3   # approaching — mixed
+    else:
+        dynamic_alpha = alpha  # far away — respect human weight
+
+    # Safety override: near floor or ceiling the controller takes over entirely.
+    near_floor = bird.y < 40.0
+    near_ceiling = bird.y > WINDOW_HEIGHT - 60.0
+    if near_floor or near_ceiling:
+        return auto_signal
+
+    return dynamic_alpha * human_signal + (1.0 - dynamic_alpha) * auto_signal
 
 
 # ---------------------------------------------------------------------------
